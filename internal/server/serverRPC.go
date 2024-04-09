@@ -2,190 +2,152 @@ package server
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"orca-peer/internal/fileshare"
+	pb "orcanet/market"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
-	record "github.com/libp2p/go-libp2p-record"
-	"github.com/libp2p/go-libp2p/core/crypto"
-	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/peer"
 	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
-	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 	"github.com/multiformats/go-multiaddr"
 )
 
-type OrcaValidator struct{}
+var (
+	clientMode = flag.Bool("client", false, "run this program in client mode")
+	bootstrap  = flag.String("bootstrap", "", "multiaddresses to bootstrap to")
+	addr       = flag.String("addr", "", "multiaddresses to listen to")
+)
 
-// testing, will actually validate later
-func (v OrcaValidator) Validate(key string, value []byte) error {
-	return nil
+type DHTvalue struct {
+	Ids    string
+	Names  string
+	Ips    string
+	Ports  string
+	Prices string
 }
 
-func (v OrcaValidator) Select(key string, value [][]byte) (int, error) {
+type CustomValidator struct{}
+
+func (cv CustomValidator) Select(string, [][]byte) (int, error) {
 	return 0, nil
 }
 
-type fileShareServerNode struct {
-	fileshare.UnimplementedFileShareServer
-	savedFiles   map[string][]*fileshare.FileDesc // read-only after initialized
-	mu           sync.Mutex                       // protects routeNotes
-	currentCoins float64
+func (cv CustomValidator) Validate(key string, value []byte) error {
+	//  length := 10
+	//  hexRegex := regexp.MustCompile("^[0-9a-fA-F]{" + strconv.Itoa(length) + "}$")
+	//  if !hexRegex.MatchString(key) {
+	// 	 return errors.New("input is not a valid hexadecimal string or does not match the expected length")
+	//  }
+	return nil
 }
 
 func CreateDHTConnection(bootstrapAddress *string) (context.Context, *dht.IpfsDHT) {
-	if *bootstrapAddress == "local" {
+	ctx := context.Background()
+	flag.Parse()
+
+	// Construct listening address
+	var listenAddrString string
+	if *addr == "" {
+		listenAddrString = "/ip4/0.0.0.0/tcp/0"
+	} else {
+		listenAddrString = *addr
+	}
+	listenAddr, _ := multiaddr.NewMultiaddr(listenAddrString)
+
+	var bootstrapPeers []multiaddr.Multiaddr
+
+	// Connect to bootstrap peers
+	if len(*bootstrap) > 0 {
+		bootstrapAddr, err := multiaddr.NewMultiaddr(*bootstrap)
+		if err != nil {
+			fmt.Errorf("Invalid bootstrap address: %s", err)
+		}
+		bootstrapPeers = append(bootstrapPeers, bootstrapAddr)
+	}
+
+	// Create host
+	privKey, err := LoadOrCreateKey("./peer_identity.key")
+	if err != nil {
+		panic(err)
+	}
+
+	host, err := libp2p.New(libp2p.ListenAddrs(listenAddr), libp2p.Identity(privKey))
+	if err != nil {
+		fmt.Errorf("Failed to create host: %s", err)
+	}
+
+	for _, addr := range host.Addrs() {
+		fullAddr := fmt.Sprintf("%s/p2p/%s", addr, host.ID())
+		fmt.Println("Listen address:", fullAddr)
+	}
+	// Initialize the DHT
+	var kademliaDHT *dht.IpfsDHT
+	if *clientMode {
+		kademliaDHT, err = dht.New(ctx, host, dht.Mode(dht.ModeClient))
+	} else {
+		kademliaDHT, err = dht.New(ctx, host, dht.Mode(dht.ModeServer))
+	}
+	if err != nil {
+		fmt.Errorf("Failed to create DHT: %s", err)
 		return nil, nil
 	}
-	bootstrapPeer := "/ip4/194.113.75.165/tcp/44981/p2p/QmS6bES2qGSCN1vTmxEjZGDwwLw5Lsm2ToAcpzf97S7BnR"
-	if *bootstrapAddress != "" {
-		bootstrapPeer = *bootstrapAddress
-	}
-	isClient := false
 
-	ctx := context.Background()
+	// Connect the validator
+	kademliaDHT.Validator = &CustomValidator{}
 
-	//Generate private key for peer
-	privKey, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
-	if err != nil {
-		panic(err)
+	// Bootstrap the DHT
+	if err := kademliaDHT.Bootstrap(ctx); err != nil {
+		fmt.Errorf("Failed to bootstrap DHT: %s", err)
 	}
 
-	//Construct multiaddr from string and create host to listen on it
-	sourceMultiAddr, _ := multiaddr.NewMultiaddr("/ip4/0.0.0.0/tcp/44981")
-	opts := []libp2p.Option{
-		libp2p.ListenAddrStrings(sourceMultiAddr.String()),
-		libp2p.Identity(privKey), //derive id from private key
-	}
-	host, err := libp2p.New(opts...)
-	if err != nil {
-		panic(err)
-	}
+	connectToBootstrapPeers(ctx, host, bootstrapPeers)
 
-	log.Printf("Host ID: %s", host.ID())
-	log.Printf("Connect to me on:")
-	for _, addr := range host.Addrs() {
-		log.Printf("%s/p2p/%s", addr, host.ID())
-	}
+	// Create the user, connect to peers and run CLI
+	user := promptForUserInfo(ctx)
+	routingDiscovery := drouting.NewRoutingDiscovery(kademliaDHT)
 
-	//An array if we want to expand to a more stable peer list instead of providing in args
-	bootstrapPeers := []string{
-		bootstrapPeer,
-	}
+	fmt.Println("Looking for existence of peers on the network before proceeding...")
+	checkPeerExistence(ctx, host, kademliaDHT, routingDiscovery)
+	fmt.Println("Peer(s) found! proceeding with the application.")
 
-	// Start a DHT, for use in peer discovery. We can't just make a new DHT
-	// client because we want each peer to maintain its own local copy of the
-	// DHT, so that the bootstrapping node of the DHT can go down without
-	// inhibiting future peer discovery.
-	var validator record.Validator = OrcaValidator{}
-	var options []dht.Option
-	if isClient { //if no bootstrap peer, go into server mode
-		options = append(options, dht.Mode(dht.ModeClient))
-	} else {
-		options = append(options, dht.Mode(dht.ModeServer))
-	}
-	options = append(options, dht.ProtocolPrefix("orcanet/market"), dht.Validator(validator))
-	kDHT, err := dht.New(ctx, host, options...)
-	if err != nil {
-		panic(err)
-	}
-
-	// Bootstrap the DHT. In the default configuration, this spawns a Background
-	// thread that will refresh the peer table every five minutes.
-	log.Println("Bootstrapping the DHT")
-	if err = kDHT.Bootstrap(ctx); err != nil {
-		panic(err)
-	}
-
-	// Let's connect to the bootstrap nodes first. They will tell us about the
-	// other nodes in the network.
-	var wg sync.WaitGroup
-	for _, peerAddrString := range bootstrapPeers {
-		if peerAddrString == "" {
-			continue
-		}
-		peerAddr, err := multiaddr.NewMultiaddr(peerAddrString)
-		if err != nil {
-			panic(err)
-		}
-		peerinfo, _ := peer.AddrInfoFromP2pAddr(peerAddr)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := host.Connect(ctx, *peerinfo); err != nil {
-				log.Println("WARNING: ", err)
-			} else {
-				log.Println("Connection established with bootstrap node:", *peerinfo)
-			}
-		}()
-	}
-	wg.Wait()
-
-	go discoverPeers(ctx, host, kDHT, "orcanet/market")
-	time.Sleep(5 * time.Second)
-
-	return ctx, kDHT
+	return ctx, kademliaDHT
 }
-func PlaceKey(ctx context.Context, kDHT *dht.IpfsDHT, putKey string, putValue string) {
-	err := kDHT.PutValue(ctx, "orcanet/market/"+putKey, []byte(putValue))
-	if err != nil {
-		fmt.Println("Error: ", err)
-		time.Sleep(5 * time.Second)
-		return
-	}
-	fmt.Println("Put key: ", putKey+" Value: "+putValue)
-	fmt.Print("> ")
-}
-func SearchKey(ctx context.Context, kDHT *dht.IpfsDHT, searchKey string) []string {
-	valueStream, err := kDHT.SearchValue(ctx, "orcanet/market/"+searchKey)
-	fmt.Println("Searching for " + searchKey)
-	fmt.Print("> ")
-	if err != nil {
-		fmt.Println("Error: ", err)
-		time.Sleep(5 * time.Second)
-		return nil
-	}
-	time.Sleep(5 * time.Second)
-	allAddress := make([]string, 0)
-	for byteArray := range valueStream {
-		allAddress = append(allAddress, string(byteArray))
-		fmt.Print("Found value: ")
-		fmt.Println(string(byteArray))
-		fmt.Print("> ")
-	}
-	return allAddress
-}
-func discoverPeers(ctx context.Context, h host.Host, kDHT *dht.IpfsDHT, advertise string) {
-	routingDiscovery := drouting.NewRoutingDiscovery(kDHT)
-	dutil.Advertise(ctx, routingDiscovery, advertise)
 
-	// Look for others who have announced and attempt to connect to them
-	for {
-		//fmt.Println("Searching for peers...")
-		peerChan, err := routingDiscovery.FindPeers(ctx, advertise)
-		if err != nil {
-			panic(err)
-		}
-		for peer := range peerChan {
-			if peer.ID == h.ID() {
-				continue // No self connection
-			}
-			err := h.Connect(ctx, peer)
-			if err != nil {
-				fmt.Printf("Failed connecting to %s, error: %s\n", peer.ID, err)
-			} else {
-				// fmt.Println("Connected to:", peer.ID)
-			}
-		}
-		time.Sleep(time.Second * 10)
+// promptForUserInfo creates a user struct based on information
+// entered by the user in the terminal
+//
+// Parameters:
+// - ctx: A context.Context for controlling the function's execution lifetime.
+//
+// Returns: A *pb.User containing the ID, name, IP address, port, and price of the user
+func promptForUserInfo(ctx context.Context) *pb.User {
+	var username string
+	fmt.Print("Enter username: ")
+	fmt.Scanln(&username)
+
+	// Generate a random ID for new user
+	userID := fmt.Sprintf("user%d", rand.Intn(10000))
+
+	fmt.Print("Enter a price for supplying files: ")
+	var price int64
+	fmt.Scanln(&price)
+
+	user := &pb.User{
+		Id:    userID,
+		Name:  username,
+		Ip:    "localhost",
+		Port:  416320,
+		Price: price,
 	}
+
+	return user
 }
 
 func sendFileToConsumer(w http.ResponseWriter, r *http.Request) {
